@@ -354,6 +354,12 @@ async function login() {
                 userId: user.username
             };
 
+            // Save session
+            sessionStorage.setItem('cce_session', JSON.stringify({
+                user: currentUser,
+                timestamp: Date.now()
+            }));
+
             document.getElementById('loginPage').classList.add('hidden');
             document.getElementById('dashboardContainer').classList.remove('hidden');
             document.getElementById('welcomeUser').textContent = `Welcome, ${currentUser.name}`;
@@ -379,8 +385,10 @@ async function login() {
             }
             
             setTimeout(() => preloadCriticalData(), 100);
-            
             hideError();
+
+            // Push state to prevent back to login
+            history.pushState(null, '', window.location.href);
         } else {
             showError('Invalid username or password');
         }
@@ -403,6 +411,7 @@ function hideError() {
 }
 
 function logout() {
+    sessionStorage.removeItem('cce_session');
     currentUser = null;
     selectedClassForModal = null;
     selectedSubjectForModal = null;
@@ -426,6 +435,7 @@ function logout() {
     hideError();
     
     showLogin();
+    history.pushState(null, '', window.location.href);
 }
 
 function showSignup() {
@@ -501,7 +511,7 @@ async function submitSignup() {
 
         const result = await api.addRow('registration', rowData);
 
-        if (result && (result.success || result.includes?.('Success'))) {
+        if (result && (result.success || result.message?.includes('Success'))) {
             showSignupSuccess('Account created successfully! Please contact admin for login credentials.');
             document.getElementById('signupForm').reset();
             hideSignupError();
@@ -777,7 +787,6 @@ async function uploadFileToTask(taskId, taskTitle, file) {
                 </span>
             `;
             
-            // REMOVED: checkAndCompleteTask - No longer auto-completing tasks on upload
             showNotification('File uploaded successfully! Points will be assigned by admin.', 'success');
         } else if (result && result.error === 'already_uploaded') {
             alert('You have already uploaded a file for this task. Please contact admin to re-upload.');
@@ -1451,7 +1460,7 @@ async function loadAdminClassSubjectData(classNum, subject) {
             }
         }
         
-        // Load students
+        // Load students with expandable cards
         await loadAdminClassStudents(classNum);
         
     } catch (error) {
@@ -1460,6 +1469,9 @@ async function loadAdminClassSubjectData(classNum, subject) {
     }
 }
 
+// =============================
+// 👨‍🎓 Admin Students with Expandable Cards
+// =============================
 async function loadAdminClassStudents(classNum) {
     try {
         const users = await api.getSheet("user_credentials");
@@ -1521,19 +1533,27 @@ async function loadAdminClassStudents(classNum) {
             const totalPoints = completedTasks.reduce((sum, p) => sum + (parseInt(p.grade) || 0), 0);
             
             return `
-                <div class="student-card">
-                    <div class="student-avatar">${initials}</div>
-                    <div class="student-name">${student.full_name || student.username}</div>
-                    <div class="student-username">@${student.username}</div>
-                    <div class="student-class">Class ${student.class}</div>
-                    <div class="text-xs text-gray-600 mt-2">
-                        ${completedTasks.length} tasks • ${totalPoints} points
+                <div class="student-card" id="student-card-${student.username}" onclick="toggleStudentExpand('${student.username}')">
+                    <div class="student-card-inner">
+                        <div class="student-avatar">${initials}</div>
+                        <div class="student-name">${student.full_name || student.username}</div>
+                        <div class="student-username">@${student.username}</div>
+                        <div class="student-class">Class ${student.class}</div>
+                        <div class="text-xs text-gray-600 mt-2">
+                            ${completedTasks.length} tasks • ${totalPoints} points
+                        </div>
+                        <div class="mt-3">
+                            <button onclick="event.stopPropagation(); openEditPointsForStudent('${student.username}', '${student.full_name || student.username}', '${classNum}')" 
+                                    class="edit-points-btn">
+                                <i class="fas fa-edit mr-1"></i>Edit Points
+                            </button>
+                        </div>
+                        <div class="mt-2">
+                            <i class="fas fa-chevron-down expand-toggle-icon" id="expand-icon-${student.username}"></i>
+                        </div>
                     </div>
-                    <div class="mt-3">
-                        <button onclick="event.stopPropagation(); openEditPointsForStudent('${student.username}', '${student.full_name || student.username}', '${classNum}')" 
-                                class="edit-points-btn">
-                            <i class="fas fa-edit mr-1"></i>Edit Points
-                        </button>
+                    <div class="student-expand-content" id="expand-content-${student.username}">
+                        <div class="expand-loading"><i class="fas fa-spinner fa-spin"></i> Loading uploads...</div>
                     </div>
                 </div>
             `;
@@ -1548,7 +1568,196 @@ async function loadAdminClassStudents(classNum) {
     }
 }
 
-// Open edit points modal for a student showing all their tasks
+// Toggle student expand/collapse
+async function toggleStudentExpand(username) {
+    const content = document.getElementById(`expand-content-${username}`);
+    const card = document.getElementById(`student-card-${username}`);
+    const icon = document.getElementById(`expand-icon-${username}`);
+    
+    if (!content) return;
+    
+    if (content.classList.contains('open')) {
+        content.classList.remove('open');
+        card.classList.remove('expanded');
+        if (icon) icon.classList.remove('rotated');
+        return;
+    }
+    
+    // Close any other open expands
+    document.querySelectorAll('.student-expand-content.open').forEach(el => {
+        if (el.id !== `expand-content-${username}`) {
+            el.classList.remove('open');
+            const parentCard = el.closest('.student-card');
+            if (parentCard) parentCard.classList.remove('expanded');
+            const iconId = el.id.replace('expand-content-', 'expand-icon-');
+            const otherIcon = document.getElementById(iconId);
+            if (otherIcon) otherIcon.classList.remove('rotated');
+        }
+    });
+    
+    // Open this one
+    content.classList.add('open');
+    card.classList.add('expanded');
+    if (icon) icon.classList.add('rotated');
+    
+    // Load uploads if not already loaded
+    if (content.dataset.loaded !== 'true') {
+        content.innerHTML = '<div class="expand-loading"><i class="fas fa-spinner fa-spin"></i> Loading uploads...</div>';
+        await loadStudentUploadsForExpand(username, content);
+        content.dataset.loaded = 'true';
+    }
+}
+
+// Load uploads and task info for expanded student card
+async function loadStudentUploadsForExpand(username, container) {
+    try {
+        const [uploads, progress, tasks] = await Promise.all([
+            api.getUserUploads(username),
+            api.getSheet(`${username}_progress`),
+            api.getSheet(`${currentUser.adminClasses?.[0] || selectedClassForModal}_tasks_master`) // use class from context
+        ]);
+        
+        // Get the class from the current selection or from user
+        const classNum = selectedClassForModal || currentUser.adminClasses?.[0];
+        let allTasks = [];
+        if (classNum) {
+            const tasksData = await api.getSheet(`${classNum}_tasks_master`);
+            if (tasksData && Array.isArray(tasksData)) allTasks = tasksData;
+        }
+        
+        if (!allTasks.length) {
+            container.innerHTML = '<div class="no-uploads-msg">No tasks available for this class.</div>';
+            return;
+        }
+        
+        // Build a map of task_id -> upload info
+        const uploadMap = {};
+        if (uploads && Array.isArray(uploads)) {
+            uploads.forEach(u => {
+                const tid = String(u.task_id);
+                if (!uploadMap[tid]) uploadMap[tid] = [];
+                uploadMap[tid].push(u);
+            });
+        }
+        
+        // Build progress map
+        const progressMap = {};
+        if (progress && Array.isArray(progress)) {
+            progress.forEach(p => {
+                if (p.item_type === "task" && p.status === "complete") {
+                    progressMap[String(p.item_id)] = {
+                        completed: true,
+                        grade: p.grade || 0
+                    };
+                }
+            });
+        }
+        
+        // Build HTML for each task
+        let html = '';
+        allTasks.forEach(task => {
+            const taskId = String(task.task_id);
+            const taskUploads = uploadMap[taskId] || [];
+            const taskProgress = progressMap[taskId];
+            const isCompleted = !!taskProgress;
+            const points = isCompleted ? taskProgress.grade : 0;
+            
+            html += `
+                <div class="expand-task-item">
+                    <div class="task-meta">
+                        <span class="task-id">${taskId}</span>
+                        <span class="task-status-badge ${isCompleted ? 'complete' : 'pending'}">
+                            ${isCompleted ? 'Completed (' + points + '/30)' : 'Pending'}
+                        </span>
+                    </div>
+                    <div class="task-title-expand">${task.title}</div>
+                    <div class="task-desc-expand">${task.description}</div>
+                    <div class="upload-actions">
+                        ${taskUploads.length > 0 ? taskUploads.map(u => `
+                            <a href="${u.file_url}" target="_blank" class="file-link">
+                                <i class="fas fa-file-pdf"></i> ${u.file_name || 'PDF'}
+                            </a>
+                        `).join('') : '<span class="no-upload">No PDF uploaded</span>'}
+                        <div class="points-group">
+                            <label>Points:</label>
+                            <input type="number" min="0" max="30" value="${isCompleted ? points : ''}" 
+                                   id="points-input-${taskId}-${username}" placeholder="0-30">
+                            <button class="save-points-btn" onclick="updatePointsFromExpand('${username}', '${taskId}', this)">
+                                ${isCompleted ? 'Update' : 'Complete'}
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            `;
+        });
+        
+        container.innerHTML = html;
+        
+    } catch (error) {
+        console.error('Error loading student uploads:', error);
+        container.innerHTML = '<div class="no-uploads-msg">Error loading data. Please try again.</div>';
+    }
+}
+
+// Update points from expand card
+async function updatePointsFromExpand(username, taskId, btn) {
+    const container = btn.closest('.expand-task-item');
+    const input = container.querySelector('input[type="number"]');
+    if (!input) return;
+    
+    const points = parseInt(input.value);
+    if (isNaN(points) || points < 0 || points > 30) {
+        alert('Please enter valid points (0-30).');
+        return;
+    }
+    
+    const originalText = btn.innerHTML;
+    btn.innerHTML = '<i class="fas fa-spinner fa-spin"></i>';
+    btn.disabled = true;
+    
+    try {
+        // Determine if already completed
+        const isCompleted = container.querySelector('.task-status-badge.complete') !== null;
+        let result;
+        if (isCompleted) {
+            result = await api.updateTaskPoints(username, taskId, points);
+        } else {
+            result = await api.markTaskComplete(username, taskId, points);
+        }
+        
+        if (result && result.success) {
+            // Update UI
+            const badge = container.querySelector('.task-status-badge');
+            if (badge) {
+                badge.className = 'task-status-badge complete';
+                badge.textContent = `Completed (${points}/30)`;
+            }
+            const btnLabel = container.querySelector('.save-points-btn');
+            if (btnLabel) btnLabel.textContent = 'Update';
+            showNotification('Points updated successfully!', 'success');
+            
+            // Refresh the student card summary (points count)
+            // We can reload the entire students list to keep everything consistent, but that's heavy.
+            // Instead, we can just update the points display in the card header.
+            // For simplicity, reload the class subject data (which reloads students)
+            const selectedClass = document.getElementById('adminTaskClassSelect').value;
+            const selectedSubject = document.getElementById('adminTaskSubjectSelect').value;
+            if (selectedClass && selectedSubject) {
+                await loadAdminClassSubjectData(selectedClass, selectedSubject);
+            }
+        } else {
+            throw new Error(result?.error || 'Failed to update points');
+        }
+    } catch (error) {
+        console.error('Error updating points:', error);
+        alert('Error: ' + error.message);
+    } finally {
+        btn.innerHTML = originalText;
+        btn.disabled = false;
+    }
+}
+
+// Open edit points modal for a student (existing multi-edit)
 async function openEditPointsForStudent(username, fullName, classNum) {
     try {
         const modal = document.getElementById('editPointsModal');
@@ -2684,3 +2893,36 @@ function showChangePasswordSuccess(message) {
     successDiv.classList.remove('hidden');
     successDiv.scrollIntoView({ behavior: 'smooth', block: 'center' });
 }
+
+// =============================
+// 🚀 Auto-restore session on load (if not already handled)
+// =============================
+(function() {
+    const saved = sessionStorage.getItem('cce_session');
+    if (saved && !currentUser) {
+        try {
+            const data = JSON.parse(saved);
+            if (data.user && data.timestamp && (Date.now() - data.timestamp < 24 * 60 * 60 * 1000)) {
+                currentUser = data.user;
+                // We need to re-run the dashboard setup, but we can call the login flow again
+                // However, the page might already be loaded, so we simulate login.
+                // This is a fallback if the inline script didn't run.
+                console.log('Restoring session from cce.js');
+                document.getElementById('loginPage').classList.add('hidden');
+                document.getElementById('dashboardContainer').classList.remove('hidden');
+                document.getElementById('welcomeUser').textContent = `Welcome, ${currentUser.name}`;
+                loadUserProfile(currentUser.username);
+                if (currentUser.role === 'admin') {
+                    document.getElementById('studentNav').classList.add('hidden');
+                    document.getElementById('adminNav').classList.remove('hidden');
+                    loadAdminData().then(() => showPage('adminTasks'));
+                } else {
+                    document.getElementById('studentNav').classList.remove('hidden');
+                    document.getElementById('adminNav').classList.add('hidden');
+                    loadTasks().then(() => showPage('tasks'));
+                }
+                setTimeout(() => preloadCriticalData(), 100);
+            }
+        } catch (e) {}
+    }
+})();
